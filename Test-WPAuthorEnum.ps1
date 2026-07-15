@@ -61,7 +61,16 @@ $found = [System.Collections.Generic.HashSet[string]]::new()
 $script:LastRequest = $null
 
 # TLS 1.2 for older PowerShell 5.1 hosts
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+# Add TLS 1.2 (and 1.3 where the runtime supports it) to whatever is already
+# enabled, rather than pinning to a single version. Pinning to Tls12 alone
+# breaks connections to servers that only offer TLS 1.3.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    # Tls13 enum only exists on newer .NET; add it if available
+    if ([Enum]::IsDefined([Net.SecurityProtocolType], 'Tls13')) {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+    }
+} catch {}
 
 function Write-Result {
     param([string]$Vector, [string]$Status, [string]$Detail)
@@ -212,6 +221,135 @@ try {
 } catch {
     Write-Result "oEmbed" "CLOSED" "not accessible"
 }
+
+# ---------------------------------------------------------------------------
+# 6. WordPress core version fingerprint
+# ---------------------------------------------------------------------------
+Write-Host "`n--- 6. WordPress version ---" -ForegroundColor Cyan
+$wpVer = $null
+
+# 6a. generator meta tag on the homepage
+try {
+    $homePage = Invoke-Probe -Uri "$base/"
+    if ($homePage.Content -match '<meta[^>]*name=["'']generator["''][^>]*content=["'']WordPress\s*([0-9.]+)') {
+        $wpVer = $matches[1]
+        Write-Result "generator meta" "INFO" "WordPress $wpVer"
+    } else {
+        Write-Result "generator meta" "CLOSED" "stripped from homepage"
+    }
+} catch { Write-Result "generator meta" "INFO" $_.Exception.Message }
+
+# 6b. RSS feed <generator>
+try {
+    $feed = Invoke-Probe -Uri "$base/feed/"
+    if ($feed.Content -match 'wordpress\.org/\?v=([0-9.]+)') {
+        if (-not $wpVer) { $wpVer = $matches[1] }
+        Write-Result "feed generator" "INFO" "WordPress $($matches[1])"
+    } else {
+        Write-Result "feed generator" "CLOSED" "no version in feed"
+    }
+} catch { Write-Result "feed generator" "CLOSED" "feed not accessible" }
+
+# 6c. readme.html at web root (should be deleted on hardened installs)
+try {
+    $rm = Invoke-Probe -Uri "$base/readme.html"
+    if ($rm.Content -match 'Version\s*([0-9.]+)') {
+        if (-not $wpVer) { $wpVer = $matches[1] }
+        Write-Result "readme.html" "LEAK" "present, Version $($matches[1]) (delete this file)"
+    } else {
+        Write-Result "readme.html" "INFO" "present but no version parsed"
+    }
+} catch { Write-Result "readme.html" "CLOSED" "not present (good)" }
+
+# 6d. ?ver= query string on core-bundled assets (last-resort hint)
+try {
+    if ($homePage -and $homePage.Content -match 'wp-(?:includes|admin)/[^"'']*\?ver=([0-9.]+)') {
+        Write-Result "asset ?ver" "INFO" "core asset advertises ver=$($matches[1])"
+    } else {
+        Write-Result "asset ?ver" "CLOSED" "no core asset version exposed"
+    }
+} catch {}
+
+# ---------------------------------------------------------------------------
+# 7. PHP / server stack (response headers)
+# ---------------------------------------------------------------------------
+Write-Host "`n--- 7. PHP / server headers ---" -ForegroundColor Cyan
+try {
+    $h = Invoke-Probe -Uri "$base/"
+    $hdr = $h.Headers
+    $php = $hdr['X-Powered-By']
+    if ($php -and $php -match 'PHP/([0-9.]+)') {
+        Write-Result "X-Powered-By" "LEAK" "$php (suppress expose_php)"
+    } elseif ($php) {
+        Write-Result "X-Powered-By" "INFO" "$php"
+    } else {
+        Write-Result "X-Powered-By" "CLOSED" "not exposed (good)"
+    }
+    if ($hdr['Server']) {
+        $srv = $hdr['Server']
+        $status = if ($srv -match '[0-9]') { 'LEAK' } else { 'INFO' }
+        Write-Result "Server" $status "$srv"
+    } else {
+        Write-Result "Server" "CLOSED" "not exposed"
+    }
+} catch { Write-Result "headers" "INFO" $_.Exception.Message }
+
+# ---------------------------------------------------------------------------
+# 8. Active theme(s)  (references in homepage HTML + style.css header)
+# ---------------------------------------------------------------------------
+Write-Host "`n--- 8. Themes ---" -ForegroundColor Cyan
+$themes = @{}
+try {
+    if (-not $homePage) { $homePage = Invoke-Probe -Uri "$base/" }
+    [regex]::Matches($homePage.Content, '/wp-content/themes/([a-zA-Z0-9._-]+)/') |
+        ForEach-Object { $themes[$_.Groups[1].Value] = $true }
+    if ($themes.Keys.Count -eq 0) {
+        Write-Result "themes" "CLOSED" "no theme path in homepage HTML"
+    }
+    foreach ($t in $themes.Keys) {
+        $ver = '?'
+        try {
+            $css = Invoke-Probe -Uri "$base/wp-content/themes/$t/style.css"
+            if ($css.Content -match '(?im)^\s*Version:\s*([0-9A-Za-z._-]+)') { $ver = $matches[1] }
+        } catch {}
+        Write-Result "theme" "INFO" ("{0}  (version {1})" -f $t, $ver)
+    }
+} catch { Write-Result "themes" "INFO" $_.Exception.Message }
+
+# ---------------------------------------------------------------------------
+# 9. Plugins  (references in HTML/REST + readme.txt version)
+# ---------------------------------------------------------------------------
+Write-Host "`n--- 9. Plugins ---" -ForegroundColor Cyan
+$plugins = @{}
+try {
+    if (-not $homePage) { $homePage = Invoke-Probe -Uri "$base/" }
+    [regex]::Matches($homePage.Content, '/wp-content/plugins/([a-zA-Z0-9._-]+)/') |
+        ForEach-Object { $plugins[$_.Groups[1].Value] = $true }
+
+    # REST namespaces also hint at active plugins
+    try {
+        $idx = Invoke-Probe -Uri "$base/wp-json"
+        $obj = $null; try { $obj = $idx.Content | ConvertFrom-Json } catch {}
+        if ($obj.namespaces) {
+            foreach ($ns in $obj.namespaces) {
+                if ($ns -notmatch '^(wp|oembed)/') { $plugins["(rest:$ns)"] = $true }
+            }
+        }
+    } catch {}
+
+    if ($plugins.Keys.Count -eq 0) {
+        Write-Result "plugins" "CLOSED" "none referenced in homepage HTML or REST"
+    }
+    foreach ($p in $plugins.Keys) {
+        if ($p -like '(rest:*') { Write-Result "plugin" "INFO" "$p"; continue }
+        $ver = '?'
+        try {
+            $readme = Invoke-Probe -Uri "$base/wp-content/plugins/$p/readme.txt"
+            if ($readme.Content -match '(?im)^\s*Stable tag:\s*([0-9A-Za-z._-]+)') { $ver = $matches[1] }
+        } catch {}
+        Write-Result "plugin" "INFO" ("{0}  (readme version {1})" -f $p, $ver)
+    }
+} catch { Write-Result "plugins" "INFO" $_.Exception.Message }
 
 # ---------------------------------------------------------------------------
 # Summary
