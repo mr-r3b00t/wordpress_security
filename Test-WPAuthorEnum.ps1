@@ -188,12 +188,21 @@ try {
     if ($obj -and $obj.routes) {
         $userRoute = ($obj.routes.PSObject.Properties.Name -match '/wp/v2/users').Count -gt 0
     }
-    $embeddedAuthors = ([regex]::Matches($body, '"author"\s*:\s*\{')).Count
+    # A real leak is an embedded user RECORD (slug/name/link fields), not the
+    # API describing an "author" query parameter. Match the former, exclude the latter.
+    $realAuthorObjs = [regex]::Matches(
+        $body,
+        '"author"\s*:\s*\{[^}]*"(?:slug|name|link)"\s*:'
+    )
+    $embeddedAuthors = $realAuthorObjs.Count
+    $paramSchemas    = ([regex]::Matches($body, '"author"\s*:\s*\{[^}]*"description"\s*:')).Count
 
     if ($embeddedAuthors -gt 0) {
-        Write-Result "wp-json index" "LEAK" "$embeddedAuthors embedded author object(s) in index"
-        $ctx = [regex]::Match($body, '.{0,40}"author"\s*:\s*\{.{0,120}')
-        if ($ctx.Success) { Write-Host "        ...$($ctx.Value)..." -ForegroundColor DarkGray }
+        Write-Result "wp-json index" "LEAK" "$embeddedAuthors embedded user record(s) with slug/name/link"
+        $ctx = $realAuthorObjs[0].Value
+        Write-Host "        ...$ctx..." -ForegroundColor DarkGray
+    } elseif ($paramSchemas -gt 0) {
+        Write-Result "wp-json index" "CLOSED" "$paramSchemas 'author' query-param schema(s) only (API docs, not user data)"
     } elseif ($userRoute) {
         Write-Result "wp-json index" "INFO" "users route registered (normal); no author data embedded"
     } else {
