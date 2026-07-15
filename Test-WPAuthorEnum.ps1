@@ -165,8 +165,10 @@ try {
     } elseif ($body -match '"code"\s*:\s*"rest_') {
         Write-Result "wp/v2/users" "CLOSED" "endpoint restricted/disabled"
     } else {
-        Write-Result "wp/v2/users" "INFO" "unexpected response (see -Verbose)"
-        Write-Verbose $body
+        Write-Result "wp/v2/users" "INFO" "unexpected response - body below"
+        Write-Host "        --- raw response (wp/v2/users) ---" -ForegroundColor DarkGray
+        $show = if ($body.Length -gt 1500) { $body.Substring(0,1500) + " ...[truncated]" } else { $body }
+        ($show -split "`n") | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkGray }
     }
 } catch {
     Write-Result "wp/v2/users" "CLOSED" $_.Exception.Message
@@ -179,10 +181,23 @@ Write-Host "`n--- 3. REST index /wp-json ---" -ForegroundColor Cyan
 try {
     $r = Invoke-Probe -Uri "$base/wp-json"
     $body = $r.Content
-    if ($body -match '"author"|/wp/v2/users') {
-        Write-Result "wp-json index" "INFO" "references author routes; inspect manually"
+    $obj = $null; try { $obj = $body | ConvertFrom-Json } catch {}
+
+    # A real leak here is embedded user objects, not merely the routes existing.
+    $userRoute = $false
+    if ($obj -and $obj.routes) {
+        $userRoute = ($obj.routes.PSObject.Properties.Name -match '/wp/v2/users').Count -gt 0
+    }
+    $embeddedAuthors = ([regex]::Matches($body, '"author"\s*:\s*\{')).Count
+
+    if ($embeddedAuthors -gt 0) {
+        Write-Result "wp-json index" "LEAK" "$embeddedAuthors embedded author object(s) in index"
+        $ctx = [regex]::Match($body, '.{0,40}"author"\s*:\s*\{.{0,120}')
+        if ($ctx.Success) { Write-Host "        ...$($ctx.Value)..." -ForegroundColor DarkGray }
+    } elseif ($userRoute) {
+        Write-Result "wp-json index" "INFO" "users route registered (normal); no author data embedded"
     } else {
-        Write-Result "wp-json index" "CLOSED" "no obvious author data"
+        Write-Result "wp-json index" "CLOSED" "no author routes or data"
     }
 } catch {
     Write-Result "wp-json index" "INFO" $_.Exception.Message
